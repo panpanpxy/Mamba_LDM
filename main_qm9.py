@@ -1,4 +1,6 @@
 # Rdkit import should be first, do not move it
+from pynvml import *
+
 try:
     from rdkit import Chem
 except ModuleNotFoundError:
@@ -18,6 +20,7 @@ from equivariant_diffusion.utils import assert_correctly_masked
 from equivariant_diffusion import utils as flow_utils
 import torch
 import time
+import csv
 import pickle
 from qm9.utils import prepare_context, compute_mean_mad
 from train_test import train_epoch, test, analyze_and_save
@@ -132,6 +135,12 @@ parser.add_argument('--normalization_factor', type=float, default=1,
                     help="Normalize the sum aggregation of EGNN")
 parser.add_argument('--aggregation_method', type=str, default='sum',
                     help='"sum" or "mean"')
+#--log GPU Power Usage
+parser.add_argument('--log_power',action='store_true',
+                    help='Enable GPU power logging')
+#--log GPU Memory
+parser.add_argument('--log_memory',action='store_true',
+                    help='Enable GPU memory logging')
 args = parser.parse_args()
 #获取dataset的预设
 dataset_info = get_dataset_info(args.dataset, args.remove_h)
@@ -147,6 +156,25 @@ args.cuda = not args.no_cuda and torch.cuda.is_available()
 device = torch.device("cuda" if args.cuda else "cpu")
 dtype = torch.float32
 
+#log GPU Power
+nvmlInit()
+handle = nvmlDeviceGetHandleByIndex(0)
+power_log=[]
+def log_gpu_power():
+    power=nvmlDeviceGetPowerUsage(handle)/1000.0
+    power_log.append((time.time(),power))
+#log GPU memory
+def init_gpu_logging(log_path):
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    with open(log_path, "w") as f:
+        f.write("timestamp,used_memory_MB\n")
+    return log_path
+def log_gpu_memory(handle,log_path):
+    mem_info=nvmlDeviceGetMemoryInfo(handle)
+    used_MB=mem_info.used/1024**2
+    timestamp=time.time()
+    with open(log_path,"a")as f:
+        f.write(f"{timestamp},{used_MB:.2f}\n")
 #如果接续训练
 if args.resume is not None:
     exp_name = args.exp_name + '_resume'
@@ -274,6 +302,10 @@ def main():
         ema = None
         model_ema = model
         model_ema_dp = model_dp
+
+    #if args.log_memory:
+        #log_path = init_gpu_logging(f"outputs/{args.exp_name}/gpu_memory_log.csv")
+
     #model --training,testing,valid,保存最优模型+训练过程模型，打印Loss，wandb记录
     best_nll_val = 1e8
     best_nll_test = 1e8
@@ -284,6 +316,10 @@ def main():
                     model_ema=model_ema, ema=ema, device=device, dtype=dtype, property_norms=property_norms,
                     nodes_dist=nodes_dist, dataset_info=dataset_info,
                     gradnorm_queue=gradnorm_queue, optim=optim, prop_dist=prop_dist)
+        #if args.log_power:
+            #log_gpu_power()
+        #if args.log_memory:
+            #log_gpu_memory(handle,log_path)
         print(f"Epoch took {time.time() - start_epoch:.1f} seconds.")
         #testing
         if epoch % args.test_epochs == 0:
@@ -328,6 +364,9 @@ def main():
             wandb.log({"Val loss ": nll_val}, commit=True)
             wandb.log({"Test loss ": nll_test}, commit=True)
             wandb.log({"Best cross-validated test loss ": best_nll_test}, commit=True)
+            gpu_memory=torch.cuda.memory_allocated(device=device)/1024**2
+            wandb.log({"gpu_memory_allocated_MB":gpu_memory},commit=True)
+
 
 
 if __name__ == "__main__":

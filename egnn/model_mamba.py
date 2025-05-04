@@ -13,7 +13,7 @@ class EGMN_dynamics_QM9(nn.Module):
         super().__init__()
         self.mode=mode
         if mode=='egmn_dynamics':
-            self.egmn=EGMN(n_node_nf=in_node_nf + context_node_nf, in_edge_nf=1,
+            self.egmn=EGMN(in_node_nf=in_node_nf + context_node_nf, in_edge_nf=1,
                 hidden_nf=hidden_nf, device=device, act_fn=act_fn,
                 n_layers=n_layers, attention=attention, tanh=tanh, norm_constant=norm_constant,
                 inv_sublayers=inv_sublayers, sin_embedding=sin_embedding,
@@ -33,7 +33,7 @@ class EGMN_dynamics_QM9(nn.Module):
         self.context_node_nf=context_node_nf
         self.device=device
         self.n_dims=n_dims
-        self._edge_dict={}
+        self._edges_dict = {} #缓存字典，用于存储已经生成的边信息，避免重复
         self.condition_time=condition_time
 
     def forward(self, t, xh, node_mask, edge_mask, context=None):
@@ -158,8 +158,8 @@ class EGMN_encoder_QM9(nn.Module):
         num_classes=in_node_nf-include_charges #h_cat
         self.mode=mode
         if mode=='egmn_dynamics':
-            self.egmn = EGMN(n_node_nf=in_node_nf + context_node_nf, in_edge_nf=1,
-                             hidden_nf=hidden_nf, device=device, act_fn=act_fn,
+            self.egmn = EGMN(in_node_nf=in_node_nf + context_node_nf, out_node_nf=hidden_nf,
+                             in_edge_nf=1,hidden_nf=hidden_nf, device=device, act_fn=act_fn,
                              n_layers=n_layers, attention=attention, tanh=tanh, norm_constant=norm_constant,
                              inv_sublayers=inv_sublayers, sin_embedding=sin_embedding,
                              normalization_factor=normalization_factor,
@@ -190,7 +190,7 @@ class EGMN_encoder_QM9(nn.Module):
         self.context_node_nf=context_node_nf
         self.device=device
         self.n_dims=n_dims
-        self._edge_dict={}
+        self._edges_dict={}
         #self.condition_time=condition_time
         self.out_node_nf=out_node_nf
 
@@ -237,7 +237,6 @@ class EGMN_encoder_QM9(nn.Module):
         else:
             raise Exception("Wrong mode %s" % self.mode)
         vel = vel.view(bs, n_nodes, -1)
-
         if torch.any(torch.isnan(vel)):
             print('Warning: detected nan, resetting EGMN output to zero.')
             vel = torch.zeros_like(vel)
@@ -246,7 +245,6 @@ class EGMN_encoder_QM9(nn.Module):
             vel=remove_mean(vel)
         else:
             vel=remove_mean_with_mask(vel,node_mask.view(bs,n_nodes,1))
-
         h_final=self.final_mlp(h_final)
         h_final=h_final*node_mask if node_mask is not None else h_final
         h_final=h_final.view(bs,n_nodes,-1)
@@ -297,35 +295,42 @@ class EGMN_encoder_QM9(nn.Module):
             self._edges_dict[n_nodes] = {}
             return self.get_adj_matrix(n_nodes, batch_size, device)
 
+
 class EGMN_decoder_QM9(nn.Module):
     def __init__(self, in_node_nf, context_node_nf, out_node_nf,
                  n_dims, hidden_nf=64, device='cpu',
                  act_fn=torch.nn.SiLU(), n_layers=4, attention=False,
                  tanh=False, mode='egmn_dynamics', norm_constant=0,
                  inv_sublayers=2, sin_embedding=False, normalization_factor=100, aggregation_method='sum',
-                 include_charges=True, bi=False, order_method='No', d_state=64, dropout=0, mamba_mlp=False):
+                 include_charges=True,bi = False, order_method = 'No', d_state = 64, dropout = 0, mamba_mlp = False):
         super().__init__()
 
         include_charges = int(include_charges)
         num_classes = out_node_nf - include_charges
+
+        self.mode = mode
         if mode == 'egmn_dynamics':
-            self.egmn = EGMN(n_node_nf=in_node_nf + context_node_nf, in_edge_nf=1,
-                             hidden_nf=hidden_nf, device=device, act_fn=act_fn,
-                             n_layers=n_layers, attention=attention, tanh=tanh, norm_constant=norm_constant,
-                             inv_sublayers=inv_sublayers, sin_embedding=sin_embedding,
-                             normalization_factor=normalization_factor,
-                             aggregation_method=aggregation_method,
-                             bi=bi, d_state=d_state, dropout=dropout, order_method=order_method,
-                             mamba_mlp=mamba_mlp)
+            self.egmn = EGMN(
+                in_node_nf=in_node_nf + context_node_nf, out_node_nf=out_node_nf,
+                in_edge_nf=1, hidden_nf=hidden_nf, device=device, act_fn=act_fn,
+                n_layers=n_layers, attention=attention, tanh=tanh, norm_constant=norm_constant,
+                inv_sublayers=inv_sublayers, sin_embedding=sin_embedding,
+                normalization_factor=normalization_factor,
+                aggregation_method=aggregation_method,
+                bi=bi, d_state=d_state, dropout=dropout, order_method=order_method,
+                mamba_mlp=mamba_mlp
+            )
             self.in_node_nf = in_node_nf
         elif mode == 'gmn_dynamics':
             self.gmn = GMN(
-                in_node_nf=in_node_nf + context_node_nf + 3, in_edge_nf=0,
-                hidden_nf=hidden_nf, out_node_nf=3 + in_node_nf, device=device,
+                in_node_nf=in_node_nf + context_node_nf + 3, out_node_nf=out_node_nf + 3,
+                in_edge_nf=0, hidden_nf=hidden_nf, device=device,
                 act_fn=act_fn, n_layers=n_layers, attention=attention,
                 normalization_factor=normalization_factor, aggregation_method=aggregation_method,
-                i=bi, d_state=d_state, dropout=dropout, order_method=order_method,
-                mamba_mlp=mamba_mlp)
+                bi=bi, d_state=d_state, dropout=dropout, order_method=order_method,
+                mamba_mlp=mamba_mlp
+            )
+
         self.num_classes = num_classes
         self.include_charges = include_charges
         self.context_node_nf = context_node_nf
@@ -380,7 +385,7 @@ class EGMN_decoder_QM9(nn.Module):
         vel = vel.view(bs, n_nodes, -1)
 
         if torch.any(torch.isnan(vel)):
-            print('Warning: detected nan, resetting EGNN output to zero.')
+            print('Warning: detected nan, resetting EGMN output to zero.')
             vel = torch.zeros_like(vel)
 
         if node_mask is None:
@@ -414,4 +419,3 @@ class EGMN_decoder_QM9(nn.Module):
         else:
             self._edges_dict[n_nodes] = {}
             return self.get_adj_matrix(n_nodes, batch_size, device)
-

@@ -19,56 +19,65 @@ class E_GCL_mask(E_GCL_mamba):
         self.act_fn = act_fn
 
     def coord_model(self, coord, edge_index, coord_diff, edge_feat, edge_mask):
-        row, col = edge_index
+        src, dst = edge_index
         trans = coord_diff * self.coord_mlp(edge_feat) * edge_mask
-        agg = unsorted_segment_sum(trans, row, num_segments=coord.size(0))
+        agg = unsorted_segment_sum(trans, src, num_segments=coord.size(0))
         coord += agg*self.coords_weight
         return coord
 
     def forward(self, h, edge_index, coord, node_mask, edge_mask, edge_attr=None, node_attr=None, n_nodes=None):
-        row, col = edge_index
+        src, dst = edge_index
         radial, coord_diff = self.coord2radial(edge_index, coord)
 
-        edge_feat = self.edge_model(h[row], h[col], radial, edge_attr)
+        mi,edge_feat = self.edge_model(h,edge_index, radial, edge_attr)
 
         edge_feat = edge_feat * edge_mask
 
         # TO DO: edge_feat = edge_feat * edge_mask
-        if self.order_method=='degree':
-            degrees= torch.zeros(len(h), dtype=torch.int32).cuda()
-            degrees.scatter_add_(0,row,torch.ones(row.size(0),dtype=torch.int32).cuda())
-            degrees.scatter_add_(0,col,torch.ones(col.size(0),dtype=torch.int32).cuda())
+        if self.order_method == 'degree':
+            # print('-----------------DEGREE!!!!!!!---------------------')
+            degrees = torch.zeros(len(h), dtype=torch.int32).cuda()
+            degrees.scatter_add_(0, dst, torch.ones(dst.size(0), dtype=torch.int32).cuda())
+            degrees.scatter_add_(0, src, torch.ones(src.size(0), dtype=torch.int32).cuda())
             sorted_indices = torch.argsort(degrees)
             sorted_h = h[sorted_indices]
             h = sorted_h
-            sorted_edge_feat=edge_feat[sorted_indices]
-            edge_feat=sorted_edge_feat
-        elif self.order_method=='degree_with_shuffle':
-            degrees= torch.zeros(len(h), dtype=torch.int32).cuda()
-            degrees.scatter_add_(0, row, torch.ones(row.size(0), dtype=torch.int32).cuda())
-            degrees.scatter_add_(0, col, torch.ones(col.size(0), dtype=torch.int32).cuda())
-            sorted_indices=torch.argsort(degrees)
-            unique_degrees=degrees[sorted_indices].unique(sorted=True)
-            new_indices=[]
+            sorted_mi = mi[sorted_indices]
+            mi = sorted_mi
+
+        elif self.order_method == 'degree_with_shuffle':
+            # print('-------------DEGREE with SHUFFLE!!!!!!!----------------')
+            degrees = torch.zeros(len(h), dtype=torch.int32).cuda()
+            degrees.scatter_add_(0, dst, torch.ones(dst.size(0), dtype=torch.int32).cuda())
+            degrees.scatter_add_(0, src, torch.ones(src.size(0), dtype=torch.int32).cuda())
+            sorted_indices = torch.argsort(degrees)
+            unique_degrees = degrees[sorted_indices].unique(sorted=True)
+            new_indices = []
             for degree in unique_degrees:
-                same_degree_indices=sorted_indices[degrees[sorted_indices]==degree]
-                same_degree_indices_list=same_degree_indices.tolist()
+                same_degree_indices = sorted_indices[degrees[sorted_indices] == degree]
+                same_degree_indices_list = same_degree_indices.tolist()
                 random.shuffle(same_degree_indices_list)
                 new_indices.extend(same_degree_indices_list)
-            new_indices=torch.tensor(new_indices).cuda()
-            sorted_h=h[new_indices]
-            h=sorted_h
-            sorted_edge_feat=edge_feat[new_indices]
-            edge_feat=sorted_edge_feat
+            new_indices = torch.tensor(new_indices).cuda()
+            sorted_h = h[new_indices]
+            h = sorted_h
+            sorted_mi = mi[sorted_indices]
+            mi = sorted_mi
 
         #coord = self.coord_model(coord, edge_index, coord_diff, edge_feat, edge_mask)
-        h, agg = self.node_model(h, edge_index, edge_feat, node_attr)
+        #h, agg = self.node_model(h, edge_index, edge_feat, node_attr)
+        if node_attr is not None:
+            h = self.node_mlp(torch.cat([mi, h, node_attr], dim=-1))
+        else:
+            h = self.node_mlp(torch.cat([mi, h], dim=-1))
+        h = self.pre_norm(h)
+        h = torch.clamp(h, min=-10, max=10)
         if self.bi:
-            output2=self.mamba2(h.unsequeeze(0)).sequeeze(0)
-            output3=self.mamba2(torch.flip(h,[0]).unsqueeze(0)).sequeeze(0)
+            output2=self.mamba2(h.unsqueeze(0)).squeeze(0)
+            output3=self.mamba2(torch.flip(h,[0]).unsqueeze(0)).squeeze(0)
             output=h+output2+output3
         else:
-            output=self.mamba2(h.unsequeeze(0)).sequeeze(0)
+            output=self.mamba2(h.unsqueeze(0)).squeeze(0)
         if self.dropout:
             output=self.out_dropout(output)
         if self.mamba_mlp:
@@ -122,9 +131,9 @@ class EGNN(nn.Module):
 
 
 
-class EGNN(nn.Module):
+class EGNN_mamba(nn.Module):
     def __init__(self, in_node_nf, in_edge_nf, hidden_nf, device='cpu', act_fn=nn.SiLU(), n_layers=4, coords_weight=1.0, attention=False, node_attr=1):
-        super(EGNN, self).__init__()
+        super(EGNN_mamba, self).__init__()
         self.hidden_nf = hidden_nf
         self.device = device
         self.n_layers = n_layers

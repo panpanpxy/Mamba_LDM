@@ -1,6 +1,6 @@
 import sys, os
 sys.path.append(os.path.abspath(os.path.join('../../')))
-from qm9.property_prediction.models_prop_mamba import EGNN, Naive, NumNodes
+from qm9.property_prediction.models_prop_mamba import EGNN_mamba, Naive, NumNodes
 import torch
 from torch import nn, optim
 import argparse
@@ -100,8 +100,8 @@ def test(model, epoch, loader, mean, mad, property, device, log_interval, debug_
 
 
 def get_model(args):
-    if args.model_name == 'egnn':
-        model = EGNN(in_node_nf=5, in_edge_nf=0, hidden_nf=args.nf, device=args.device, n_layers=args.n_layers,
+    if args.model_name == 'egmn':
+        model = EGNN_mamba(in_node_nf=5, in_edge_nf=0, hidden_nf=args.nf, device=args.device, n_layers=args.n_layers,
                      coords_weight=1.0,
                      attention=args.attention, node_attr=args.node_attr)
     elif args.model_name == 'naive':

@@ -237,6 +237,7 @@ class EGNN_encoder_QM9(nn.Module):
         else:
             raise Exception("Wrong mode %s" % self.mode)
         vel = vel.view(bs, n_nodes, -1)
+        print(h_final.shape)
 
         if torch.any(torch.isnan(vel)):
             print('Warning: detected nan, resetting EGNN output to zero.')

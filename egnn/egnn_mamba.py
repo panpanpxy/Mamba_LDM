@@ -3,6 +3,8 @@ import torch.nn as nn
 from torch_scatter import scatter_sum
 from mamba_ssm import Mamba
 import random
+import os
+from torch.nn.utils.rnn import pad_sequence
 
 class CrossAttention(nn.Module):
     def __init__(self, embed_dim, num_heads):
@@ -41,7 +43,7 @@ class Mamba_GCL(nn.Module):
         self.order_method=order_method
         if self.mamba_mlp:
             self.mamba_merge_mlp=nn.Sequential(
-                 nn.Linear(hidden_nf+input_nf+nodes_att_dim,hidden_nf)
+                 nn.Linear(hidden_nf*2,hidden_nf)
             )
 
         self.mamba2=Mamba(d_model=hidden_nf, #model dimension
@@ -49,19 +51,21 @@ class Mamba_GCL(nn.Module):
                           d_conv=4, #local convolution with
                           expand=1, #block expansion factor
                           )
+        self.mamba_norm=nn.LayerNorm(hidden_nf)
+        self.pre_norm=nn.LayerNorm(hidden_nf)
         #边mlp层
         self.edge_mlp = nn.Sequential(
             nn.Linear(input_edge + edges_in_d, hidden_nf),
             act_fn,
             nn.Linear(hidden_nf, hidden_nf),
             act_fn)
-        self.edge_inf=nn.Sequential(nn.Linear(hidden_nf,1),nn.Sigmoid()) #calculate edge_w
+        #self.edge_inf=nn.Sequential(nn.Linear(hidden_nf,1),nn.Sigmoid()) #calculate edge_w
         #节点mlp层
         self.node_mlp = nn.Sequential(
-            nn.Linear(hidden_nf + input_nf + nodes_att_dim, hidden_nf),
+            nn.Linear(hidden_nf*2, hidden_nf),
             act_fn,
-            nn.Linear(hidden_nf, output_nf))
-        #注意力层
+            nn.Linear(hidden_nf, hidden_nf))
+        #注意力层 cacluate edge#W
         if self.attention:
             self.att_mlp = nn.Sequential(
                 nn.Linear(hidden_nf, 1),
@@ -69,114 +73,166 @@ class Mamba_GCL(nn.Module):
 
         if self.dropout!=0:
             self.out_dropout=nn.Dropout(p=self.dropout)
+
    #更新边特征
-    def edge_model(self, source, target, edge_attr, edge_mask):
+    def edge_model(self,x, edge_index,edge_attr, edge_mask):
+        dst,src=edge_index
+        hi,hj=x[dst],x[src]
         if edge_attr is None:  # Unused.
-            out = torch.cat([source, target], dim=1)
+            out = torch.cat([hj, hi], dim=1)
         else:
-            out = torch.cat([source, target, edge_attr], dim=1)
+            out = torch.cat([hj, hi, edge_attr], dim=1)
         #更新后的边特征
-        mij = self.edge_mlp(out)
-        #边权重的存在概率(取值0~1），作为加权因子
-        eij=self.edge_inf(mij)
-        #out为经过注意力更新后的边特征 different from mij
+        mij = self.edge_mlp(out)#mij mi dim=hidden_nf
+        if edge_mask is not None:
+            mij = mij * edge_mask
+            #边权重的存在概率(取值0~1）,使用attention 相当于加入边的权重 att_val作为加权因子，确保更重要的边对目标节点特征的贡献更大
         if self.attention:
             att_val = self.att_mlp(mij)
-            out = mij * att_val
+            mi=scatter_sum(mij * att_val, dst, dim=0, dim_size=x.shape[0])
         else:
-            out = mij
-
-        if edge_mask is not None:
-            out = out * edge_mask
-        return out, mij,eij
+            mi = scatter_sum(mij, dst, dim=0, dim_size=x.shape[0])
+        return mi, mij
     #更新节点特征 这里的x是节点特征不是coordinate
-    def node_model(self, x, edge_index, edge_attr, node_attr):
-        row, col = edge_index
-        agg = unsorted_segment_sum(edge_attr, row, num_segments=x.size(0),
-                                   normalization_factor=self.normalization_factor,
-                                   aggregation_method=self.aggregation_method)
-        if node_attr is not None:
-            agg = torch.cat([x, agg, node_attr], dim=1)
-        else:
-            agg = torch.cat([x, agg], dim=1)
-        out = x + self.node_mlp(agg)
+    #def node_model(self, x, edge_index, edge_attr, node_attr):
+    #   dst, src = edge_index
+    #    agg = unsorted_segment_sum(edge_attr, dst, num_segments=x.size(0),
+    #                               normalization_factor=self.normalization_factor,
+    #                               aggregation_method=self.aggregation_method)
+    #    if node_attr is not None:
+    #        agg = torch.cat([x, agg, node_attr], dim=1)
+    #    else:
+    #        agg = torch.cat([x, agg], dim=1)
+    #    out = x + self.node_mlp(agg)
         #返回update的h和聚合的边信息
-        return out, agg
+    #    return out, agg
 
     def forward(self, h, edge_index, edge_attr=None, node_attr=None, node_mask=None, edge_mask=None):
+
         if torch.isnan(h).any():
             print("NaN found in input h")
             print(h)
         if torch.isnan(edge_attr).any():
             print("NaN found in input edge_attr")
             print(edge_attr)
-        row, col = edge_index
-        edge_feat, mij,eij= self.edge_model(h[row], h[col], edge_attr, edge_mask)
-        #scatter_sum 使用 eij 作为加权因子，确保更重要的边对目标节点特征的贡献更大
-        mi=scatter_sum(mij*eij,col,dim=0,dim_size=h.shape[0])
+        dst, src = edge_index
+        mi, mij = self.edge_model(h,edge_index, edge_attr, edge_mask)
         if self.order_method=='degree':
-            print('-----------------DEGREE!!!!!!!---------------------')
-            degrees=torch.zeros(len(h),dtype=torch.int32).cuda()
-            degrees.scatter_add_(0,row,torch.ones(row.size(0),dtype=torch.int32).cuda())
-            degrees.scatter_add_(0,col,torch.ones(col.size(0),dtype=torch.int32).cuda())
+            # print('-----------------DEGREE!!!!!!!---------------------')
+            degrees = torch.zeros(len(h), dtype=torch.int32).cuda()
+            degrees.scatter_add_(0, dst, torch.ones(dst.size(0), dtype=torch.int32).cuda())
+            degrees.scatter_add_(0, src, torch.ones(src.size(0), dtype=torch.int32).cuda())
             sorted_indices=torch.argsort(degrees)
             sorted_h=h[sorted_indices]
             h=sorted_h
             sorted_mi=mi[sorted_indices]
             mi=sorted_mi
+            if node_mask is not None:
+                sorted_node_mask = node_mask[sorted_indices]
+                node_mask = sorted_node_mask
+                #print(node_mask.shape)
         elif self.order_method == 'degree_with_shuffle':
-            print('--------------DGREE WITH SHUFFLE---------------------')
+            # print('-------------DEGREE with SHUFFLE!!!!!!!----------------')
             degrees = torch.zeros(len(h), dtype=torch.int32).cuda()
-            degrees.scatter_add_(0, row, torch.ones(row.size(0), dtype=torch.int32).cuda())
-            degrees.scatter_add_(0, col, torch.ones(col.size(0), dtype=torch.int32).cuda())
-            sorted_indices=torch.argsort(degrees)
-            unique_degrees=degrees[sorted_indices].unique(sorted==True)
-            new_indices=[]
+            degrees.scatter_add_(0, dst, torch.ones(dst.size(0), dtype=torch.int32).cuda())
+            degrees.scatter_add_(0, src, torch.ones(src.size(0), dtype=torch.int32).cuda())
+            sorted_indices = torch.argsort(degrees)
+            unique_degrees = degrees[sorted_indices].unique(sorted=True)
+            new_indices = []
             for degree in unique_degrees:
-                same_degree_indices=sorted_indices[degree[sorted_indices]==degree]
-                same_degree_indices_list=same_degree_indices.tolist()
+                same_degree_indices = sorted_indices[degrees[sorted_indices] == degree]
+                same_degree_indices_list = same_degree_indices.tolist()
                 random.shuffle(same_degree_indices_list)
                 new_indices.extend(same_degree_indices_list)
-            new_indices=torch.tensor(new_indices).cuda()
-            sorted_h=h[new_indices]
+            new_indices = torch.tensor(new_indices).cuda()
+            sorted_h = h[new_indices]
             h=sorted_h
-            sorted_mi=mi[new_indices]
-            mi=sorted_mi
-        h, agg = self.node_model(h, edge_index, edge_feat, node_attr)
-        h=self.node_mlp(torch.cat([mi,h],-1))
-        ######
-        # if torch.isnan(h).any():
-        #     print('NaN found in h after node_model')
+            sorted_mi = mi[sorted_indices]
+            mi = sorted_mi
+            if node_mask is not None:
+                sorted_node_mask = node_mask[sorted_indices]
+                node_mask = sorted_node_mask
+        if node_attr is not None:
+            h = self.node_mlp(torch.cat([mi, h, node_attr], dim=-1))
+        else:
+            h = self.node_mlp(torch.cat([mi, h], dim=-1))
+        h=self.pre_norm(h)
+        h=torch.clamp(h,min=-10,max=10)
+        #if torch.isnan(h).any():
+        #     print('NaN found in h after node_mlp')
         #     print(h)
-        ######
+        #print(h.shape)
         if node_mask is not None:
             h = h * node_mask
-        #bi=Flase 单向模式 直接处理h；bi=True 双向模式 除了正向特征，还计算输入特征的反转（通过 torch.flip），从而获取更丰富的context
-        if self.bi:
-            output2=self.mamba2(h.unsqueeze(0)).squeeze(0)
-            output3=self.mamba2(torch.filp(h,[0]).unsqueeze(0)).squeeze(0)
-            # output = self.bi_mamba_merge_mlp(torch.cat([output1, output2, output3], -1))
-            output=h+output2+output3
+            mask_bool = node_mask.squeeze(-1).bool() #[B*N]
+            h_seq=h[mask_bool]
+            # batch-wise(for DRUG dataset)
+            #graph_seqs = []#available node_seqs of each graph
+            #current = []
+            #for i,vaild in enumerate(mask_bool):
+            #    if vaild:
+            #        current.append(h[i]) #add current graph
+            #    else:
+            #        if current:# current graph is over
+            #            graph_seqs.append(torch.stack(current))
+            #            current=[]
+            #if current:
+            #    graph_seqs.append(torch.stack(current))
+            #batch_id>> [ Tensor[num_nodes_1,d],Tensor[num_nodes_2,d]...]
+            #padding sequences to same length :[B,L_max,D]
+            #padded_h=pad_sequence(graph_seqs,batch_first=True)#shape:[B,L_max,D]
+            #mask_lens=torch.tensor([seq.size(0) for seq in graph_seqs],device=h.device, dtype=torch.long)#shape:[B]
+            #run mamba on all at once
+            #output=self.mamba2(padded_h)
+            output = self.mamba2(h_seq.unsqueeze(0)).squeeze(0)
+            if self.bi:
+                output=output+self.mamba2(torch.flip(h_seq, [0]).unsqueeze(0)).squeeze(0)
+            if self.dropout:
+                output=self.out_dropout(output)
+            if self.mamba_mlp:
+                output = self.mamba_merge_mlp(torch.cat([h_seq, output], dim=-1))
+            #recovery original shape (h.shape)[B*N,d]
+            #output_flat = torch.zeros_like(h)
+            #ptr = 0
+            #for i, length in enumerate(mask_lens):
+            #    output_flat[ptr:ptr + length] = output[i, :length]
+            #    ptr += length
+            #output = output_flat
+            output_full = torch.zeros_like(h)
+            output_full[mask_bool] = output
+            output = output_full
         else:
-            output=self.mamba2(h.unsqueeze(0)).squeeze(0)
-            #if torch.isnan(output).any():
-            #    print("NaN found in output")
-            #    print(output)
-            #output=self.mamba_merge_mlp(torch.cat([output1, output2], -1))
-            #output=output1+output2
-        if self.dropout:
-            output=self.out_dropout(output)
-        #   if torch.isnan(output).any():
-        #       print("NaN found in output after dropout")
-        #       print(output)
-        # output = self.cross_attention(h, output)
-        if self.mamba_mlp:
-            output = self.mamba_merge_mlp(torch.cat([h, output], -1))
-            #if torch.isnan(output).any():
-            #    print("NaN found in output after mamba_merge_mlp")
-            #    print(output)
+            if self.bi:
+                output2 = self.mamba2(h.unsqueeze(0)).squeeze(0)
+                output3 = self.mamba2(torch.flip(h, [0]).unsqueeze(0)).squeeze(0)
+                # output = self.bi_mamba_merge_mlp(torch.cat([output1, output2, output3], -1))
+                output = h + output2 + output3
+            else:
+                output = self.mamba2(h.unsqueeze(0)).squeeze(0)
+                # if torch.isnan(output).any():
+                #     print("NaN found in output")
+                #     print(output)
+                # output = self.mamba_merge_mlp(torch.cat([output1, output2], -1))
+                # output = output1 + output2
+            if self.dropout:
+                output = self.out_dropout(output)
+                # if torch.isnan(output).any():
+                #     print("NaN found in output after dropout")
+                #     print(output)
+                # output = self.cross_attention(h, output)
+            if self.mamba_mlp:
+                output = self.mamba_merge_mlp(torch.cat([h, output], -1))
+                # if torch.isnan(output).any():
+                #     print("NaN found in output after mamba_merge_mlp")
+                #     print(output)
 
-        return output
+        output=self.mamba_norm(output)
+        output=torch.clamp(output,min=-10,max=10)
+        #print(output.shape)
+        if node_mask is not None:
+            output=output*node_mask
+
+        return output, mij
 
 #等变(equivariant)操作--update node coordinate
 class EquivariantUpdate(nn.Module):
@@ -247,7 +303,7 @@ class EquivariantBlock(nn.Module):
                                               act_fn=act_fn, attention=attention,
                                               normalization_factor=self.normalization_factor,
                                               aggregation_method=self.aggregation_method,
-                                              bi=self.bi,d_state=self.d_state,dropout=self.dropout,order_method=self.order_method,mamba_mlp=self.mamba_mlp))
+                                              bi=self.bi, d_state=self.d_state, dropout=self.dropout, order_method=self.order_method, mamba_mlp=self.mamba_mlp))
             #x
         self.add_module("gcl_equiv", EquivariantUpdate(hidden_nf, edges_in_d=edge_feat_nf, act_fn=nn.SiLU(), tanh=tanh,
                                                        coords_range=self.coords_range_layer,
@@ -305,7 +361,7 @@ class EGMN(nn.Module):
 
         self.embedding = nn.Linear(in_node_nf, self.hidden_nf)
         self.embedding_out = nn.Linear(self.hidden_nf, out_node_nf)
-        #多个EquivariantBlock组成的EGNN
+        #多个EquivariantBlock组成的EGMN
         for i in range(0, n_layers):
             self.add_module("e_block_%d" % i, EquivariantBlock(hidden_nf, edge_feat_nf=edge_feat_nf, device=device,
                                                                act_fn=act_fn, n_layers=inv_sublayers,
@@ -314,7 +370,7 @@ class EGMN(nn.Module):
                                                                sin_embedding=self.sin_embedding,
                                                                normalization_factor=self.normalization_factor,
                                                                aggregation_method=self.aggregation_method,
-                                                               bi=self.bi,d_state=self.d_state,dropout=self.dropout,order_method=self.order_method,mamba_mlp=self.mamba_mlp))
+                                                               bi=self.bi, d_state=self.d_state, dropout=self.dropout, order_method=self.order_method, mamba_mlp=self.mamba_mlp))
         self.to(self.device)
 
     def forward(self, h, x, edge_index, node_mask=None, edge_mask=None):
@@ -359,7 +415,7 @@ def unsorted_segment_sum(data, segment_ids, num_segments, normalization_factor, 
     """
     result_shape = (num_segments, data.size(1))
     result = data.new_full(result_shape, 0)  # Init empty result tensor.
-    segment_ids = segment_ids.unsqueeze(-1).expand(-1, data.size(1))
+    segment_ids = segment_ids.long().unsqueeze(-1).expand(-1, data.size(1))
     result.scatter_add_(0, segment_ids, data)
     if aggregation_method == 'sum':
         result = result / normalization_factor

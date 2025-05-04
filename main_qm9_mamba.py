@@ -16,6 +16,7 @@ from equivariant_diffusion import en_mamba_diffusion
 from equivariant_diffusion.utils import assert_correctly_masked
 from equivariant_diffusion import utils as flow_utils
 import torch
+from pynvml import *
 import time
 import pickle
 from qm9.utils import prepare_context, compute_mean_mad
@@ -37,7 +38,7 @@ parser.add_argument('--latent_nf', type=int, default=4,
 parser.add_argument('--kl_weight', type=float, default=0.01,
                     help='weight of KL term in ELBO')
 
-parser.add_argument('--model', type=str, default='egnn_dynamics',
+parser.add_argument('--model', type=str, default='egmn_dynamics',
                     help='our_dynamics | schnet | simple_dynamics | '
                          'kernel_dynamics | egnn_dynamics |gnn_dynamics')
 parser.add_argument('--probabilistic_model', type=str, default='diffusion',
@@ -130,6 +131,19 @@ parser.add_argument('--normalization_factor', type=float, default=1,
                     help="Normalize the sum aggregation of EGNN")
 parser.add_argument('--aggregation_method', type=str, default='sum',
                     help='"sum" or "mean"')
+# mamba layer
+parser.add_argument('--bi',type=eval,default=False)
+parser.add_argument('--d_state',type=int,default=64)
+parser.add_argument('--order_method',type=str,default='degree')
+parser.add_argument('--dropout',type=float,default=0)
+parser.add_argument('--mamba_mlp',type=eval,default=False)
+#--log GPU Power Usage
+parser.add_argument('--log_power',action='store_true',
+                    help='Enable GPU power logging')
+#--log GPU Memory
+parser.add_argument('--log_memory',action='store_true',
+                    help='Enable GPU memory logging')
+
 args = parser.parse_args()
 #获取dataset的预设
 dataset_info = get_dataset_info(args.dataset, args.remove_h)
@@ -144,6 +158,26 @@ args.wandb_usr = utils.get_wandb_username(args.wandb_usr)
 args.cuda = not args.no_cuda and torch.cuda.is_available()
 device = torch.device("cuda" if args.cuda else "cpu")
 dtype = torch.float32
+
+#log GPU Power
+nvmlInit()
+handle = nvmlDeviceGetHandleByIndex(0)
+power_log=[]
+def log_gpu_power():
+    power=nvmlDeviceGetPowerUsage(handle)/1000.0
+    power_log.append((time.time(),power))
+#log GPU memory
+def init_gpu_logging(log_path):
+    os.makedirs(os.path.dirname(log_path), exist_ok=True)
+    with open(log_path, "w") as f:
+        f.write("timestamp,used_memory_MB\n")
+    return log_path
+def log_gpu_memory(handle,log_path):
+    mem_info=nvmlDeviceGetMemoryInfo(handle)
+    used_MB=mem_info.used/1024**2
+    timestamp=time.time()
+    with open(log_path,"a")as f:
+        f.write(f"{timestamp},{used_MB:.2f}\n")
 
 if args.resume is not None:
     exp_name = args.exp_name + '_resume'
@@ -262,6 +296,10 @@ def main():
         ema = None
         model_ema = model
         model_ema_dp = model_dp
+
+    #if args.log_memory:
+        #log_path = init_gpu_logging(f"outputs/{args.exp_name}/gpu_memory_log.csv")
+
     #model --training,testing,valid,保存最优模型+训练过程模型，打印Loss，wandb记录
     best_nll_val = 1e8
     best_nll_test = 1e8
@@ -272,6 +310,10 @@ def main():
                     model_ema=model_ema, ema=ema, device=device, dtype=dtype, property_norms=property_norms,
                     nodes_dist=nodes_dist, dataset_info=dataset_info,
                     gradnorm_queue=gradnorm_queue, optim=optim, prop_dist=prop_dist)
+        #if args.log_power:
+            #log_gpu_power()
+        #if args.log_memory:
+            #log_gpu_memory(handle,log_path)
         print(f"Epoch took {time.time() - start_epoch:.1f} seconds.")
         #testing
         if epoch % args.test_epochs == 0:
@@ -316,7 +358,8 @@ def main():
             wandb.log({"Val loss ": nll_val}, commit=True)
             wandb.log({"Test loss ": nll_test}, commit=True)
             wandb.log({"Best cross-validated test loss ": best_nll_test}, commit=True)
-
+            gpu_memory = torch.cuda.memory_allocated(device=device) / 1024 ** 2
+            wandb.log({"gpu_memory_allocated_MB": gpu_memory}, commit=True)
 
 if __name__ == "__main__":
     main()
